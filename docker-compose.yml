@@ -1,0 +1,73 @@
+# RegAssist — toute la stack en une commande :  docker compose up -d --build
+#
+#   frontend (nginx :3000) ──/api──▶ api (FastAPI :8000) ──▶ postgres (pgvector :5432)
+#                                       │                       ▲
+#                                       └─▶ redis (:6379) ◀── worker (Celery) ─┘
+#
+# LLM / embeddings : configurés dans .env (Claude, OpenAI ou Ollama sur votre machine).
+# Langfuse : utiliser Langfuse Cloud (gratuit) ou leur docker-compose officiel (voir docs/09).
+
+x-backend: &backend
+  build:
+    context: ./backend
+    args:
+      LOCAL_MODELS: ${LOCAL_MODELS:-0}
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql+psycopg://regassist:regassist@postgres:5432/regassist
+    REDIS_URL: redis://redis:6379/0
+    UPLOAD_DIR: /app/data/uploads
+  volumes:
+    - ./data:/app/data
+  extra_hosts:
+    - "host.docker.internal:host-gateway"  # pour joindre Ollama installé sur la machine hôte
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: regassist
+      POSTGRES_PASSWORD: regassist
+      POSTGRES_DB: regassist
+    # 5433 côté machine : 5432 est souvent déjà pris par un PostgreSQL installé localement.
+    ports: ["127.0.0.1:5433:5432"]  # accessible depuis cette machine uniquement
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/scripts/init_test_db.sql:/docker-entrypoint-initdb.d/10-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U regassist"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["127.0.0.1:6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  api:
+    <<: *backend
+    ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8000/api/health"]
+      interval: 15s
+      retries: 5
+
+  worker:
+    <<: *backend
+    command: celery -A app.celery_app worker --loglevel=INFO --concurrency=${WORKER_CONCURRENCY:-2}
+
+  frontend:
+    build: ./frontend
+    ports: ["3000:80"]
+    depends_on: [api]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
